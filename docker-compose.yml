@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: postgres-db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: amazon-movie-reviews
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgresql-config/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d amazon-movie-reviews"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  pgadmin:
+    image: dpage/pgadmin4:9.11
+    container_name: pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@domain.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin-config/servers.json:/pgadmin4/servers.json
+      - ./pgadmin-config/pgpass:/pgadmin4/pgpass
+    depends_on:
+      postgres:
+        condition: service_healthy
+  mongo:
+    image: mongo:8
+    container_name: mongo-db
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin
+      MONGO_INITDB_DATABASE: amazon-movie-reviews
+    volumes:
+      - mongo_data:/data/db
+      - ./mongodb-config/init.js:/docker-entrypoint-initdb.d/init.js
+
+volumes:
+  postgres_data:
+  pgadmin_data:
+  mongo_data:

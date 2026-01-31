@@ -1,0 +1,273 @@
+/* QUERY 1
+Extract products liked by users similar to a target user, excluding ones that have been already
+rated by the target user, and rank them by similarity weight
+*/
+db.products.aggregate([
+  { $unwind: "$reviews" },
+
+  //Find positive reviews made by a target user
+  {
+    $match: {
+      "reviews.reviewer.id": "A5KIX8Y8H197J",
+      "reviews.score": { $gte: 4 }
+    }
+  },
+  
+  //Build a set with the IDs of the liked products
+  {
+    $group: {
+      _id: null,
+      liked_products: { $addToSet: "$_id" }
+    }
+  },
+  
+  //Find other users who liked the same products
+  {
+    $lookup: {
+      from: "products",
+      let: { likedProducts: "$liked_products" },
+      pipeline: [
+        { $unwind: "$reviews" },
+        {
+          $match: {
+            $expr: {
+              $and: [
+                { $in: ["$_id", "$$likedProducts"] },
+                { $gte: ["$reviews.score", 4] },
+                { $ne: ["$reviews.reviewer.id", "A5KIX8Y8H197J"] }
+              ]
+            }
+          }
+        }
+      ],
+      as: "similar_reviews"
+    }
+  },
+
+  { $unwind: "$similar_reviews" },
+  
+  //Compute similarity weight per user
+  {
+    $group: {
+      _id: "$similar_reviews.reviews.reviewer.id",
+      similarity_weight: { $sum: 1 },
+      liked_products: { $first: "$liked_products" }
+    }
+  },
+  
+  //Find products liked by similar users
+  {
+    $lookup: {
+      from: "products",
+      let: {
+        similarUser: "$_id",
+        weight: "$similarity_weight"
+      },
+      pipeline: [
+        { $unwind: "$reviews" },
+        {
+          $match: {
+            $expr: {
+              $and: [
+                { $eq: ["$reviews.reviewer.id", "$$similarUser"] },
+                { $gte: ["$reviews.score", 4] }
+              ]
+            }
+          }
+        },
+        {
+          $project: {
+            product_id: "$_id",
+            weight: "$$weight"
+          }
+        }
+      ],
+      as: "recommended"
+    }
+  },
+
+  { $unwind: "$recommended" },
+  
+  //Remove products already liked by target user
+  {
+    $match: {
+      $expr: { $not: { $in: ["$recommended.product_id", "$liked_products"] } }
+    }
+  },
+  
+  //Final aggregation
+  {
+    $group: {
+      _id: "$recommended.product_id",
+      strength: { $sum: "$recommended.weight" }
+    }
+  },
+
+  { $sort: { strength: -1 } }
+]);
+
+
+
+/* QUERY 2
+Compute a similarity between all pairs of reviewers based on shared high-rated products
+*/
+db.products.aggregate([
+  { $unwind: "$reviews" },
+
+  //Find positive reviews
+  {
+    $match: {
+      "reviews.score": { $gte: 4 }
+    }
+  },
+
+  //Group reviewers per product
+  {
+    $group: {
+      _id: "$_id", 
+      reviewers: { $addToSet: "$reviews.reviewer.id" }
+    }
+  },
+  
+  { $unwind: "$reviewers" },
+
+  //Self-join reviewers on the same product
+  {
+    $lookup: {
+      from: "products",
+      let: {
+        productId: "$_id",
+        reviewerA: "$reviewers"
+      },
+      pipeline: [
+        { $match: { $expr: { $eq: ["$_id", "$$productId"] } } },
+        { $unwind: "$reviews" },
+        {
+          $match: {
+            $expr: {
+              $and: [
+                { $gte: ["$reviews.score", 4] },
+                { $gt: ["$reviews.reviewer.id", "$$reviewerA"] }
+              ]
+            }
+          }
+        },
+        {
+          $project: {
+            first: "$$reviewerA",
+            second: "$reviews.reviewer.id"
+          }
+        }
+      ],
+      as: "pairs"
+    }
+  },
+
+  { $unwind: "$pairs" },
+
+  //Count common high-rated products per reviewer pair
+  {
+    $group: {
+      _id: {
+        first: "$pairs.first",
+        second: "$pairs.second"
+      },
+      similarity_score: { $sum: 1 }
+    }
+  },
+
+  //Threshold
+  {
+    $match: {
+      similarity_score: { $gt: 5 }
+    }
+  },
+
+  { $sort: { similarity_score: -1 } }
+]);
+
+
+/* QUERY 3
+Given a target user, find users who highly rated the same products of the target user in a limited time window and 
+count how many distinct products have been rated in such time window.
+*/
+db.products.aggregate([
+  { $unwind: "$reviews" },
+
+  //Find positive reviews made by a target user
+  {
+    $match: {
+      "reviews.reviewer.id": "A5KIX8Y8H197J",
+      "reviews.score": { $gte: 4 }
+    }
+  },
+  
+  //Maintain only the product IDs + creation timestamp
+  {
+    $project: {
+      product_id: "$_id",
+      target_time: "$reviews.created_at"
+    }
+  },
+  
+  //Find overlapping reviews on same product & time window (made by different users)
+  {
+    $lookup: {
+      from: "products",
+      let: {
+        pid: "$product_id",
+        ttime: "$target_time"
+      },
+      pipeline: [
+        { $unwind: "$reviews" },
+        {
+          $match: {
+            $expr: {
+              $and: [
+                { $eq: ["$_id", "$$pid"] },
+                { $gte: ["$reviews.score", 4] },
+                { $ne: ["$reviews.reviewer.id", "A5KIX8Y8H197J"] },
+                {
+                  $lt: [
+                    { $abs: { $subtract: ["$reviews.created_at", "$$ttime"] } },
+                    2592000
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      as: "overlapping_reviews"
+    }
+  },
+
+  { $unwind: "$overlapping_reviews" },
+  
+  //Group (user, product) pairs
+  {
+    $group: {
+      _id: {
+        user: "$overlapping_reviews.reviews.reviewer.id",
+        product: "$product_id"
+      }
+    }
+  },
+  
+  //Count how many distinct products overlap per user
+  {
+    $group: {
+      _id: "$_id.user",
+      temporal_overlap: { $sum: 1 }
+    }
+  },
+  
+  //Threshold
+  {
+    $match: {
+      temporal_overlap: { $gte: 3 }
+    }
+  },
+  
+  { $sort: { temporal_overlap: -1 } }
+]);
